@@ -6,7 +6,7 @@
 /*   By: aapricot <aapricot@student.42.fr>          +#+  +:+       +#+        */
 /*                                                +#+#+#+#+#+   +#+           */
 /*   Created: 2022/02/10 17:37:01 by aapricot          #+#    #+#             */
-/*   Updated: 2022/02/10 19:49:41 by aapricot         ###   ########.fr       */
+/*   Updated: 2022/02/11 22:54:36 by aapricot         ###   ########.fr       */
 /*                                                                            */
 /* ************************************************************************** */
 
@@ -14,10 +14,17 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/mman.h>
+#include <stdint.h>
+#include <x86intrin.h>
+
+// TODO: Implement sine ourselves
+#include <math.h>
 
 #define internal static
 #define local_persist static
 #define global_variable static
+
+#define Pi32 3.14159265359f
 
 typedef int8_t int8;
 typedef int16_t int16;
@@ -28,6 +35,9 @@ typedef uint8_t uint8;
 typedef uint16_t uint16;
 typedef uint32_t uint32;
 typedef uint64_t uint64;
+
+typedef float real32;
+typedef double real64;
 
 struct sdl_offscreen_buffer
 {
@@ -45,17 +55,11 @@ struct sdl_window_dimension
 	int Height;
 };
 
-global_variable sdl_offscreen_buffer GlobalBuffer;
+global_variable sdl_offscreen_buffer GlobalBackBuffer;
 
 #define MAX_CONTROLLERS 4
 SDL_GameController *ControllerHandles[MAX_CONTROLLERS];
 SDL_Haptic *RumbleHandles[MAX_CONTROLLERS];
-
-internal void
-SDLAudioCallback(void *UserData, uint8 *AudioData, int Length)
-{
-	memset(AudioData, 0, Length);
-}
 
 internal void
 SDLInitAudio(int32 SamplesPerSecond, int32 BufferSize)
@@ -66,12 +70,8 @@ SDLInitAudio(int32 SamplesPerSecond, int32 BufferSize)
 	AudioSettings.format = AUDIO_S16LSB;
 	AudioSettings.channels = 2;
 	AudioSettings.samples = BufferSize;
-	AudioSettings.callback = &SDLAudioCallback;
 
 	SDL_OpenAudio(&AudioSettings, 0);
-
-	printf("Initialised an Audio device at frequency %d Hz, %d Channels\n",
-			AudioSettings.freq, AudioSettings.channels);
 	
 	if (AudioSettings.format != AUDIO_S16LSB)
 	{
@@ -79,7 +79,6 @@ SDLInitAudio(int32 SamplesPerSecond, int32 BufferSize)
 		SDL_CloseAudio();
 	}
 
-	SDL_PauseAudio(0);
 }
 
 sdl_window_dimension
@@ -93,13 +92,13 @@ SDLGetWindowDimension(SDL_Window *Window)
 }
 
 internal void
-RenderWeirdGradient(sdl_offscreen_buffer Buffer, int BlueOffset, int GreenOffset)
+RenderWeirdGradient(sdl_offscreen_buffer *Buffer, int BlueOffset, int GreenOffset)
 {
-	uint8 *Row = (uint8 *)Buffer.Memory;
-	for(int Y = 0; Y < Buffer.Height; ++Y)
+	uint8 *Row = (uint8 *)Buffer->Memory;
+	for(int Y = 0; Y < Buffer->Height; ++Y)
 	{
 		uint32 *Pixel = (uint32 *)Row;
-		for(int X = 0; X < Buffer.Width; ++X)
+		for(int X = 0; X < Buffer->Width; ++X)
 		{
 			uint8 Blue = (X + BlueOffset);
 			uint8 Green = (Y + GreenOffset);
@@ -107,7 +106,7 @@ RenderWeirdGradient(sdl_offscreen_buffer Buffer, int BlueOffset, int GreenOffset
 			*Pixel++ = ((Green << 8) | Blue);
 		}
 
-		Row += Buffer.Pitch;
+		Row += Buffer->Pitch;
 	}
 }
 
@@ -141,15 +140,15 @@ SDLResizeTexture(sdl_offscreen_buffer *Buffer, SDL_Renderer *Renderer, int Width
 }
 
 internal void
-SDLUpdateWindow(SDL_Window *Window, SDL_Renderer *Renderer, sdl_offscreen_buffer Buffer)
+SDLUpdateWindow(SDL_Window *Window, SDL_Renderer *Renderer, sdl_offscreen_buffer *Buffer)
 {
-	SDL_UpdateTexture(Buffer.Texture,
+	SDL_UpdateTexture(Buffer->Texture,
 					0,
-					Buffer.Memory,
-					Buffer.Pitch);
+					Buffer->Memory,
+					Buffer->Pitch);
 	
 	SDL_RenderCopy(Renderer,
-					Buffer.Texture,
+					Buffer->Texture,
 					0,
 					0);
 	
@@ -264,13 +263,49 @@ bool	HandleEvent(SDL_Event *Event)
 				{
 					SDL_Window *Window = SDL_GetWindowFromID(Event->window.windowID);
 					SDL_Renderer *Renderer = SDL_GetRenderer(Window);
-					SDLUpdateWindow(Window, Renderer, GlobalBuffer);
+					SDLUpdateWindow(Window, Renderer, &GlobalBackBuffer);
 				} break;
 			}
 		} break;
 	}
 
 	return(ShouldQuit);
+}
+
+struct sdl_sound_output
+{
+	int SamplesPerSecond;
+	int ToneHz;
+	int16 ToneVolume;
+	uint32 RunningSampleIndex;
+	int WavePeriod;
+	int BytesPerSample;
+	int SecondaryBufferSize;
+	real32 tSine;
+	int LatencySampleCount;
+};
+
+internal void
+SDLFillSoundBuffer(sdl_sound_output *SoundOutput, int ByteToLock, int BytesToWrite)
+{
+	int SampleCount = BytesToWrite / SoundOutput->BytesPerSample;
+	void *AudioBuffer = malloc(BytesToWrite);
+	int16 *SampleOut = (int16 *)AudioBuffer;
+	for(int SampleIndex = 0; SampleIndex < SampleCount; ++SampleIndex)
+	{
+		// TODO: Draw this out for people
+		real32 SineValue = sinf(SoundOutput->tSine);
+		int16 SampleValue = (int16)(SineValue * SoundOutput->ToneVolume);
+		*SampleOut++ = SampleValue;
+		*SampleOut++ = SampleValue;
+
+		SoundOutput->tSine += 2.0f * Pi32 * 1.0f / (real32)SoundOutput->WavePeriod;
+		++SoundOutput->RunningSampleIndex;
+	}
+
+	SDL_QueueAudio(1, AudioBuffer, BytesToWrite);
+
+	free(AudioBuffer);
 }
 
 internal void
@@ -289,7 +324,8 @@ SDLOpenGameControllers()
 			break;
 		}
 		ControllerHandles[ControllerIndex] = SDL_GameControllerOpen(JoystickIndex);
-		RumbleHandles[ControllerIndex] = SDL_HapticOpen(JoystickIndex);
+		SDL_Joystick *JoystickHandle = SDL_GameControllerGetJoystick(ControllerHandles[ControllerIndex]);
+		RumbleHandles[ControllerIndex] = SDL_HapticOpenFromJoystick(JoystickHandle);
 		if (RumbleHandles[ControllerIndex]
 			&& SDL_HapticRumbleInit(RumbleHandles[ControllerIndex]) != 0)
 		{
@@ -321,10 +357,9 @@ int		main(int argc, char *argv[])
 	{
 		//TODO: SDL_Init didn't work!
 	}
+	uint64 PerfCountFrequency = SDL_GetPerformanceFrequency();
 	// Initialise our Game Controllers:
 	SDLOpenGameControllers();
-	// Open our audio device:
-	SDLInitAudio(48000, 4096);
 	// Create our window.
 	SDL_Window *Window = SDL_CreateWindow("Handmade Hero",
 								SDL_WINDOWPOS_UNDEFINED,
@@ -343,9 +378,25 @@ int		main(int argc, char *argv[])
 		{
 			bool Running = true;
 			sdl_window_dimension Dimension = SDLGetWindowDimension(Window);
-			SDLResizeTexture(&GlobalBuffer, Renderer, Dimension.Width, Dimension.Height);
+			SDLResizeTexture(&GlobalBackBuffer, Renderer, Dimension.Width, Dimension.Height);
 			int XOffset = 0;
 			int YOffset = 0;
+
+			sdl_sound_output SoundOutput = {};
+
+			SoundOutput.SamplesPerSecond = 48000;
+			SoundOutput.ToneHz = 494;
+			SoundOutput.ToneVolume = 3000;
+			SoundOutput.WavePeriod = SoundOutput.SamplesPerSecond / SoundOutput.ToneHz;
+			SoundOutput.BytesPerSample = sizeof(int16) * 2;
+			SoundOutput.LatencySampleCount = SoundOutput.SamplesPerSecond / 15;
+			// Open our audio device:
+			SDLInitAudio(SoundOutput.SamplesPerSecond, SoundOutput.SamplesPerSecond * SoundOutput.BytesPerSample / 60);
+			SDLFillSoundBuffer(&SoundOutput, 0, SoundOutput.LatencySampleCount * SoundOutput.BytesPerSample);
+			SDL_PauseAudio(0);
+
+			uint64 LastCounter = SDL_GetPerformanceCounter();
+			uint64 LastCycleCount = _rdtsc();
 			while(Running)
 			{
 				SDL_Event Event;
@@ -379,17 +430,11 @@ int		main(int argc, char *argv[])
 						int16 StickX = SDL_GameControllerGetAxis(ControllerHandles[ControllerIndex], SDL_CONTROLLER_AXIS_LEFTX);
 						int16 StickY = SDL_GameControllerGetAxis(ControllerHandles[ControllerIndex], SDL_CONTROLLER_AXIS_LEFTY);
 
-						if (AButton)
-						{
-							YOffset += 2;
-						}
-						if (BButton)
-						{
-							if (RumbleHandles[ControllerIndex])
-							{
-								SDL_HapticRumblePlay(RumbleHandles[ControllerIndex], 0.5f, 2000);
-							}
-						}
+						XOffset += StickX / 4096;
+						YOffset += StickY / 4096;
+
+						SoundOutput.ToneHz = 512 + (int)(256.0f * ((real32)StickY / 30000.0f));
+						SoundOutput.WavePeriod = SoundOutput.SamplesPerSecond / SoundOutput.ToneHz;
 					}
 					else
 					{
@@ -397,10 +442,28 @@ int		main(int argc, char *argv[])
 					}
 				}
 
-				RenderWeirdGradient(GlobalBuffer, XOffset, YOffset);
-				SDLUpdateWindow(Window, Renderer, GlobalBuffer);
+				RenderWeirdGradient(&GlobalBackBuffer, XOffset, YOffset);
 
-				++XOffset;
+				// Sound output test
+				int TargetQueueBytes = SoundOutput.LatencySampleCount * SoundOutput.BytesPerSample;
+				int BytesToWrite = TargetQueueBytes - SDL_GetQueuedAudioSize(1);
+				SDLFillSoundBuffer(&SoundOutput, 0, BytesToWrite);
+
+				SDLUpdateWindow(Window, Renderer, &GlobalBackBuffer);
+				uint64 EndCycleCount = _rdtsc();
+				uint64 EndCounter = SDL_GetPerformanceCounter();
+				uint64 CounterElapsed = EndCounter - LastCounter;
+				uint64 CycleElapsed = EndCycleCount - LastCycleCount;
+
+				real64 MSPerFrame = (((1000.0f * (real64)CounterElapsed) / (real64)PerfCountFrequency));
+				real64 FPS = (real64)PerfCountFrequency / (real64)CounterElapsed;
+				real64 MCPF = ((real64)CycleElapsed / (1000.0f * 1000.0f));
+
+				printf("%.02fms/f, %.02f/s, %.02fmc/f\n", MSPerFrame, FPS, MCPF);
+
+				LastCycleCount = EndCycleCount;
+				LastCounter = EndCounter;
+
 			}
 		}
 		else
@@ -413,8 +476,6 @@ int		main(int argc, char *argv[])
 		//TODO: Logging
 	}
 
-
-	
 	SDLCloseGameControllers();
 	SDL_Quit();
 	return(0);
